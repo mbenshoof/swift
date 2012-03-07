@@ -49,7 +49,7 @@ from swift.common.constraints import check_metadata, check_object_creation, \
     MAX_CONTAINER_NAME_LENGTH, MAX_FILE_SIZE
 from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout
-
+from swift.common.client import *
 
 def update_headers(response, headers):
     """
@@ -683,7 +683,7 @@ class Controller(object):
                             res.bytes_transferred += len(chunk)
                     except GeneratorExit:
                         res.client_disconnect = True
-                        self.app.logger.warn(_('Client disconnected on read'))
+                        self.app.logger.warn(_('Client disconnected on read: Read [%d] bytes from [%s] - Method: %s - URL: %s') % (res.bytes_transferred, source.sock.getpeername(), req.method, req.url))
                     except (Exception, TimeoutError):
                         self.exception_occurred(node, _('Object'),
                             _('Trying to read during GET of %s') % req.path)
@@ -1337,8 +1337,80 @@ class ContainerController(Controller):
             cache_key = get_container_memcache_key(self.account_name,
                                                    self.container_name)
             self.app.memcache.delete(cache_key)
-        return self.make_requests(req, self.app.container_ring,
+
+        resp = self.make_requests(req, self.app.container_ring,
                 container_partition, 'PUT', req.path_info, headers)
+
+        if resp.status_int == 201:
+            self.handle_autosync(req, container_partition, containers)
+        return resp
+
+    @public
+    def handle_autosync(self, req, container_partition, containers):
+        """Handle the autosync logic - if needed."""
+
+        if self.app.autosync == "auto":
+            try:
+                if int(req.headers['X-Autosync-Skip']) == 1:
+                    self.app.logger.info("Autosync :: Disabled [X-Autosync-Skip Header Set]")
+                    return
+            except Exception, e:
+                self.app.logger.info("Autosync :: Enabled [No X-Autosync-Skip Header]")
+                pass
+
+        elif self.app.autosync == "manual":
+            try:
+                if int(req.headers['X-Autosync-Run']) != 1:
+                    self.app.logger.info("Autosync :: Disabled [X-Autosync-Run Header Not 1]")
+                    return
+                else:
+                    self.app.logger.info("Autosync :: Enabled [X-Autosync-Run Header Set]")
+            except Exception, e:
+                self.app.logger.info("Autosync :: Disabled [X-Autosync-Run Header Not Set]")
+                return
+        else:
+            self.app.logger.info("Autosync :: Disabled [In Config]")
+            return
+
+        try:
+            usr = "%s:%s" % (self.app.autosync_account, self.app.autosync_user)
+            stor, tok = get_auth(self.app.autosync_cluster,
+                                    usr,
+                                    self.app.autosync_pass)
+
+            self.app.logger.info("Autosync :: Remote Storage URL: %s, %s" % (stor, tok))
+
+            try:
+                stats = head_container(stor, tok, self.container_name)
+            except Exception, e:
+                self.app.logger.info("Autosync :: Remote Container NOT FOUND, create")
+                put_container(stor, tok, self.container_name)
+                stats = head_container(stor, tok, self.container_name)
+                self.app.logger.info("Autosync :: Remote Containter created")
+
+            remote_container = "%s/%s" % (stor, self.container_name)
+            self.app.logger.info("Autosync :: Remote Containter URL: %s" % remote_container)
+
+            sync_headers = {'X-Container-Sync-To' : remote_container,
+                            'X-Container-Sync-Key' : self.app.autosync_key,
+                            'X-Timestamp': normalize_timestamp(time.time()),
+                            'x-trans-id': self.trans_id}
+            sync_headers.update(value for value in req.headers.iteritems()
+                if value[0].lower() in self.pass_through_headers or
+                    value[0].lower().startswith('x-container-meta-'))
+
+            sync_resp = self.make_requests(req,
+                                            self.app.container_ring,
+                                            container_partition,
+                                            'POST',
+                                            req.path_info,
+                                            [sync_headers] * len(containers))
+        except Exception, e:
+            self.app.logger.error("Autosync :: Failed with Error: %s" % e)
+            return
+
+        self.app.logger.info("Autosync :: Container sync ENABLED")
+
 
     @public
     def POST(self, req):
@@ -1549,6 +1621,13 @@ class BaseApplication(object):
                        [os.path.join(swift_dir, 'mime.types')])
         self.account_autocreate = \
             conf.get('account_autocreate', 'no').lower() in TRUE_VALUES
+
+        self.autosync = conf.get('autosync', 'disabled')
+        self.autosync_cluster = conf.get('autosync_cluster')
+        self.autosync_account = conf.get('autosync_account')
+        self.autosync_user = conf.get('autosync_user')
+        self.autosync_pass = conf.get('autosync_pass')
+        self.autosync_key = conf.get('autosync_key')
 
     def get_controller(self, path):
         """
